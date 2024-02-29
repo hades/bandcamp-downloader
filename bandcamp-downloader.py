@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import datetime
 import html
 import http
 import json
@@ -12,6 +13,7 @@ import urllib.parse
 import traceback
 
 from concurrent.futures import ThreadPoolExecutor
+from threading import current_thread
 
 # These require pip installs
 from bs4 import BeautifulSoup, SoupStrainer
@@ -21,6 +23,7 @@ from tqdm import tqdm
 
 USER_URL = 'https://bandcamp.com/{}'
 COLLECTION_POST_URL = 'https://bandcamp.com/api/fancollection/1/collection_items'
+HIDDEN_POST_URL = 'https://bandcamp.com/api/fancollection/1/hidden_items'
 FILENAME_REGEX = re.compile('filename\\*=UTF-8\'\'(.*)')
 WINDOWS_DRIVE_REGEX = re.compile(r'[a-zA-Z]:\\')
 SANATIZE_PATH_WINDOWS_REGEX = re.compile(r'[<>:"/|?*\\]')
@@ -38,9 +41,6 @@ CONFIG = {
 MAX_THREADS = 32
 DEFAULT_THREADS = 5
 DEFAULT_FILENAME_FORMAT = os.path.join('{artist}', '{artist} - {title}')
-# As per [1], the initial total bytes is set to a large positive integer.
-# [1] https://tqdm.github.io/docs/tqdm/#set_description
-INITIAL_TOTAL_BYTES = 1*1024*1024*1024*1024 # 1 TB
 SUPPORTED_FILE_FORMATS = [
     'aac-hi',
     'aiff-lossless',
@@ -123,6 +123,29 @@ def main() -> int:
         help = 'How long, in seconds, to wait before trying to download a file again after a failure. Defaults to \'5\'.',
     )
     parser.add_argument(
+        '--include-hidden',
+        action='store_true',
+        default=False,
+        help = 'Download items in your collection that have been marked as hidden.',
+    )
+    parser.add_argument(
+        '--download-since',
+        default = '',
+        help = 'Only download items purchased on or after the given date. YYYY-MM-DD format, defaults to all items.'
+    )
+    parser.add_argument(
+        '--thread-bars',
+        action = 'store_true',
+        default = False,
+        help = 'Show one progress bar per download thread instead of just a single bar for the total downloads.',
+    )
+    parser.add_argument(
+        '--individual-bars',
+        action = 'store_true',
+        default = False,
+        help = 'Show individual Album download bars instead of just a single bar for the total downloads. Takes precedence over --thread-bars',
+    )
+    parser.add_argument(
         '--dry-run',
         action = 'store_true',
         default = False,
@@ -139,9 +162,15 @@ def main() -> int:
     CONFIG['OUTPUT_DIR'] = os.path.normcase(args.directory)
     CONFIG['FILENAME_FORMAT'] = args.filename_format
     CONFIG['BROWSER'] = args.browser
+    if args.download_since:
+        CONFIG['SINCE'] = datetime.datetime.strptime(args.download_since, '%Y-%m-%d')
+    else:
+        CONFIG['SINCE'] = None
     CONFIG['FORMAT'] = args.format
     CONFIG['FORCE'] = args.force
     CONFIG['DRY_RUN'] = args.dry_run
+    CONFIG['THREAD_BARS'] = args.thread_bars
+    CONFIG['INDIVIDUAL_BARS'] = args.individual_bars
 
     if args.wait_after_download < 0:
         parser.error('--wait-after-download must be at least 0.')
@@ -156,15 +185,27 @@ def main() -> int:
     if CONFIG['VERBOSE']: print(args)
     if CONFIG['FORCE']: print('WARNING: --force flag set, existing files will be overwritten.')
 
-    links = get_download_links_for_user(args.username)
+    links = get_download_links_for_user(args.username, args.include_hidden, CONFIG['SINCE'])
     if CONFIG['VERBOSE']: print('Found [{}] links for [{}]\'s collection.'.format(len(links), args.username))
     if not links:
-        print('WARN: No album links found for user [{}]. Are you logged in and have you selected the correct browser to pull cookies from?'.format(args.username))
+        if CONFIG['SINCE'] is None:
+            print('WARN: No album links found for user [{}]. Are you logged in and have you selected the correct browser to pull cookies from?'.format(args.username))
+        else:
+            print('WARN: No album links found for user [{}] since [{}]. Are you logged in and have you selected the correct browser to pull cookies from, and is the specified time old enough?'.format(args.username, args.download_since))
         sys.exit(2)
 
     print('Starting album downloads...')
-    CONFIG['TQDM'] = tqdm(links, unit = 'album')
+    CONFIG['TQDM'] = tqdm(
+        links,
+        unit = 'album',
+        desc = "Total",
+        position = args.parallel_downloads if CONFIG['THREAD_BARS'] or CONFIG['INDIVIDUAL_BARS'] else None,
+    )
     if args.parallel_downloads > 1:
+        if CONFIG['THREAD_BARS'] or CONFIG['INDIVIDUAL_BARS']:
+            CONFIG['THREAD_TQDMS'] = {}
+            for num in range(0, args.parallel_downloads):
+                CONFIG['THREAD_TQDMS'][num] = None
         with ThreadPoolExecutor(max_workers = args.parallel_downloads) as executor:
             executor.map(download_album, links)
     else:
@@ -173,24 +214,42 @@ def main() -> int:
     CONFIG['TQDM'].close()
     print('Done.')
 
-def generate_collection_post_payload(_user_info : dict) -> None:
-    return {
-        'fan_id' : _user_info['user_id'],
-        'count' : _user_info['collection_count'] - len(_user_info['download_urls']),
-        'older_than_token' : _user_info['last_token'],
-    }
+def filter_by_purchase_time(items : [dict], _since : datetime.datetime) -> [dict]:
+    good = []
+    for item in items:
+        purchaseTime = datetime.datetime.strptime(item['purchased'], '%d %b %Y %H:%M:%S GMT')
+        if purchaseTime >= _since:
+            good.append(item)
+    return good
 
-def get_user_collection(_user_info : dict) -> None:
+def fetch_items(_url : str, _user_id : str, _last_token : str, _count : int, _since : datetime.datetime) -> [str]:
+    payload = {
+        'fan_id' : _user_id,
+        'count' : _count,
+        'older_than_token' : _last_token,
+    }
     with requests.post(
-        COLLECTION_POST_URL,
-        data = json.dumps(generate_collection_post_payload(_user_info)),
+        _url,
+        data = json.dumps(payload),
         cookies = get_cookies(),
     ) as response:
         response.raise_for_status()
         data = json.loads(response.text)
-        _user_info['download_urls'] += data['redownload_urls'].values()
 
-def get_download_links_for_user(_user : str) -> [str]:
+        # There might be no data, for example calling `--include-hidden` with no hidden items
+        if 'redownload_urls' not in data:
+            return []
+
+        if _since is None:
+            return data['redownload_urls'].values()
+        items = []
+        for item in filter_by_purchase_time(data['items'], _since):
+            item_id = str(item['sale_item_id'])
+            item_type = item['sale_item_type']
+            items.append(data['redownload_urls'][item_type+item_id])
+        return items
+
+def get_download_links_for_user(_user : str, _include_hidden : bool, _since : datetime.datetime) -> [str]:
     print('Retrieving album links from user [{}]\'s collection.'.format(_user))
 
     soup = BeautifulSoup(
@@ -212,15 +271,42 @@ def get_download_links_for_user(_user : str) -> [str]:
         ))
         exit(2)
 
-    user_info = {
-        'collection_count' : data['collection_count'],
-        'user_id' : data['fan_data']['fan_id'],
-        'last_token' : data['collection_data']['last_token'],
-    }
-    user_info['download_urls'] = [ *data['collection_data']['redownload_urls'].values() ]
+    # The collection_data.redownload_urls includes links for both hidden and
+    # unhidden items. The unhidden items all appear before the hidden items in
+    # the raw json response, so in python 3.7+ we can probably expect that this
+    # ordering carries through to the keys of redownload_urls and just truncate
+    # the list... but this is a little uncomfortable to rely on, so let's divide
+    # them up by explicitly checking item_cache.
+    items = list(data['item_cache']['collection'].values())
+    if _include_hidden:
+        items.extend(data['item_cache']['hidden'].values())
+    if _since:
+        items = filter_by_purchase_time(items, _since)
+    item_keys = [str(item['sale_item_type']) + str(item['sale_item_id'])
+                 for item in items
+                 if 'sale_item_type' in item and 'sale_item_id' in item]
+    all_urls = data['collection_data']['redownload_urls']
+    download_urls = [all_urls[key] for key in item_keys if key in all_urls]
 
-    get_user_collection(user_info)
-    return user_info['download_urls']
+    user_id = data['fan_data']['fan_id']
+
+    download_urls.extend(fetch_items(
+        COLLECTION_POST_URL,
+        user_id,
+        data['collection_data']['last_token'],
+        # count is the number we have left to fetch after the initial data blob
+        data['collection_data']['item_count'] - len(data['item_cache']['collection']),
+        _since))
+
+    if _include_hidden:
+        download_urls.extend(fetch_items(
+            HIDDEN_POST_URL,
+            user_id,
+            data['hidden_data']['last_token'],
+            data['hidden_data']['item_count'] - len(data['item_cache']['hidden']),
+            _since))
+
+    return download_urls
 
 def download_album(_album_url : str, _attempt : int = 1) -> None:
     try:
@@ -266,8 +352,44 @@ def download_album(_album_url : str, _attempt : int = 1) -> None:
             CONFIG['TQDM'].update()
             time.sleep(CONFIG['POST_DOWNLOAD_WAIT'])
 
+def thread_tqdm_init(desc : str = None):
+    if 'THREAD_TQDMS' not in CONFIG:
+        return
+    thread_num = int(current_thread().name[-1])
+    if CONFIG['INDIVIDUAL_BARS'] or CONFIG['THREAD_TQDMS'][thread_num] is None:
+        if CONFIG['THREAD_TQDMS'][thread_num] is not None:
+            CONFIG['THREAD_TQDMS'][thread_num].close()
+
+        CONFIG['THREAD_TQDMS'][thread_num] = tqdm(
+            unit = 'bytes',
+            unit_scale = True,
+            position = thread_num,
+        )
+    CONFIG['THREAD_TQDMS'][thread_num].set_description(desc)
+    # We force refreshes here because if we don't then finished
+    # individual bars will push each other around.
+    for item in CONFIG['THREAD_TQDMS'].values():
+        if item is not None:
+            item.refresh()
+    CONFIG['TQDM'].refresh()
+
+def thread_tqdm_reset(total : int):
+    if 'THREAD_TQDMS' not in CONFIG:
+        return
+    thread_num = int(current_thread().name[-1])
+    CONFIG['THREAD_TQDMS'][thread_num].reset(total = total)
+
+def thread_tqdm_update(update : int):
+    if 'THREAD_TQDMS' not in CONFIG:
+        return
+    thread_num = int(current_thread().name[-1])
+    CONFIG['THREAD_TQDMS'][thread_num].update(update)
+    CONFIG['THREAD_TQDMS'][thread_num].refresh()
+
 def download_file(_url : str, _track_info : dict = None, _attempt : int = 1) -> None:
-    thread_tqdm = tqdm(desc = _track_info.get('title', '') if _track_info else '', total = INITIAL_TOTAL_BYTES, unit = 'bytes', unit_scale = True)
+    thread_tqdm_init(
+        desc = _track_info.get('title', '') if _track_info else '',
+    )
     try:
         with requests.get(
                 _url,
@@ -294,6 +416,8 @@ def download_file(_url : str, _track_info : dict = None, _attempt : int = 1) -> 
                     actual_size = os.stat(file_path).st_size
                     if expected_size == actual_size:
                         if CONFIG['VERBOSE'] >= 3: CONFIG['TQDM'].write('Skipping album that already exists: [{}]'.format(file_path))
+                        thread_tqdm_reset(actual_size)
+                        thread_tqdm_update(actual_size)
                         return
                     else:
                         if CONFIG['VERBOSE'] >= 2: CONFIG['TQDM'].write('Album at [{}] is the wrong size. Expected [{}] but was [{}]. Re-downloading.'.format(file_path, expected_size, actual_size))
@@ -302,11 +426,11 @@ def download_file(_url : str, _track_info : dict = None, _attempt : int = 1) -> 
             if CONFIG['DRY_RUN']:
                 return
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            thread_tqdm.reset(total = expected_size)
+            thread_tqdm_reset(total = expected_size)
             with open(file_path, 'wb') as fh:
                 for chunk in response.iter_content(chunk_size=8192):
                     fh.write(chunk)
-                    thread_tqdm.update(len(chunk))
+                    thread_tqdm_update(len(chunk))
                 actual_size = fh.tell()
             if expected_size != actual_size:
                 raise IOError('Incomplete read. {} bytes read, {} bytes expected'.format(actual_size, expected_size))
@@ -319,8 +443,6 @@ def download_file(_url : str, _track_info : dict = None, _attempt : int = 1) -> 
             print_exception(e, 'An exception occurred trying to download file url [{}]:'.format(_url))
     except Exception as e:
         print_exception(e, 'An exception occurred trying to download file url [{}]:'.format(_url))
-    finally:
-        thread_tqdm.close()
 
 def print_exception(_e : Exception, _msg : str = '') -> None:
     CONFIG['TQDM'].write('\nERROR: {}'.format(_msg))
